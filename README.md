@@ -117,6 +117,19 @@ Given this context:
 I have the following question:
 ```
 
+## Included example codebase
+
+This repository includes an example “toy repo” at `exmaple_codebase/` plus a pre-generated sample output:
+
+- `exmaple_codebase/CODEBASE_CONTEXT.md`
+
+To regenerate it (demonstrating the “copy the file into a repo and run it” workflow):
+
+```bash
+cd exmaple_codebase
+python codebase2context.py
+```
+
 ## What it detects (heuristics)
 
 - Languages: Python, JavaScript, TypeScript, Go, Rust, Java, C#, PHP
