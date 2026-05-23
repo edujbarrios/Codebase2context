@@ -92,6 +92,31 @@ Common knobs:
 - `--max-summary-chars 1200` — cap per-file summaries
 - `--max-functions 30` / `--max-classes 20` — cap extracted signatures per file
 
+## How it works (high level)
+
+- Recursively scans the repository with a deterministic walk order
+- Ignores common junk directories and binary/generated/minified files
+- Detects languages/frameworks via file extensions, dependency files, and import heuristics
+- Extracts a compact “API/architecture surface” (entrypoints, routes, models, exports)
+- Ranks important files and emits structured Markdown optimized for LLM ingestion
+
+## Example output (excerpt)
+
+```md
+Given this context:
+
+1. Project Overview
+- Purpose (inferred): ...
+- Application type (inferred): ...
+...
+
+15. Optimized Agent Context
+- App type: ...
+...
+
+I have the following question:
+```
+
 ## What it detects (heuristics)
 
 - Languages: Python, JavaScript, TypeScript, Go, Rust, Java, C#, PHP

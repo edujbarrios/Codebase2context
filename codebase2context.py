@@ -74,6 +74,9 @@ IGNORED_FILE_NAMES = {
     "go.sum",
     # secrets (prefer .env.example instead)
     ".env",
+    # tool outputs
+    "CODEBASE_CONTEXT.md",
+    "ARCHITECTURE_CONTEXT.md",
 }
 
 IGNORED_FILE_SUFFIXES = {
@@ -543,6 +546,8 @@ def importance_reasons(f: FileFacts) -> list[str]:
         if r not in seen:
             seen.add(r)
             out.append(r)
+    if not out:
+        out.append("Supporting module")
     return out[:6]
 
 def score_file(f: FileFacts) -> float:
