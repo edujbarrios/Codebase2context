@@ -1,106 +1,58 @@
 # codebase2context
 
-Created by Eduardo J. Barrios (GitHub: efujbarrios)
+Export any repository into an LLM-ready Markdown context file — offline, deterministic, and single-file.
 
-`codebase2context` is a production-quality, offline, single-file Python developer tool that scans a repository and generates a highly optimized structured Markdown context file for LLM agents (Claude, Codex, GPT, Gemini, etc.).
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Dependencies](https://img.shields.io/badge/deps-stdlib--only-success)](#requirements)
+[![Offline](https://img.shields.io/badge/offline-yes-success)](#privacy--safety)
 
-It is designed to feel like:
+`codebase2context` scans a repository and generates a structured Markdown file you can paste into an LLM (Codex, GPT, Claude, Gemini, etc.) to bootstrap architecture understanding without dumping the whole codebase.
 
-“Export this repository into an LLM-ready architecture context.”
+It’s designed to feel like: “Export this repo into an LLM-ready architecture + API surface context.”
 
-## What it generates
+## Quickstart
 
-Running the tool produces a deterministic Markdown file:
-
-- `CODEBASE_CONTEXT.md` (default output name)
-
-The generated Markdown is structured as a ready-to-use universal prompt context for AI agents, and it:
-
-- Begins with exactly: `Given this context:`
-- Ends with exactly: `I have the following question:`
-
-## Requirements
-
-- Python 3.10+
-- No external dependencies (standard library only)
-- Works fully offline (no APIs)
-
-## Using codebase2context in Any Repository
-
-The script is intentionally portable: you can copy the single `codebase2context.py` file into any repository and run it immediately.
-
-### Option 1 — Drag & Drop
-
-1. Copy or drag `codebase2context.py` into any repository folder.
-2. Open a terminal in that folder.
-3. Run:
-
-   ```bash
-   python codebase2context.py
-   ```
-
-4. The tool automatically generates:
-
-   - `CODEBASE_CONTEXT.md`
-
-### Option 2 — Analyze Another Repository
-
-You can analyze a different repository by passing its path:
+1. Copy `codebase2context.py` into the repo you want to analyze.
+2. Run:
 
 ```bash
-python codebase2context.py /path/to/project
+python codebase2context.py
 ```
 
-Example:
+This writes `CODEBASE_CONTEXT.md` into that repository.
+
+### Analyze a different repository
 
 ```bash
-python codebase2context.py ~/projects/my-app
+python /path/to/codebase2context.py /path/to/other/repo
 ```
 
-The tool will:
-
-- Scan the target repository
-- Generate the Markdown file inside that repository
-- Infer architecture automatically
-- Work regardless of framework/language (best-effort heuristics)
-
-You can also customize the output filename:
+### Customize the output file
 
 ```bash
 python codebase2context.py . --output ARCHITECTURE_CONTEXT.md
 ```
 
-This allows engineers to:
+## Requirements
 
-- Onboard new AI agents quickly
-- Reuse architecture context
-- Share codebase understanding
-- Standardize LLM context engineering
-- Avoid pasting entire repositories into chats
-- Reduce token costs dramatically
+- Python 3.10+
+- Standard library only (no dependencies)
+- Works fully offline (no network calls)
 
-## CLI options
+## What it generates
 
-```bash
-python codebase2context.py --help
-```
+By default the tool writes `CODEBASE_CONTEXT.md`. The output is intentionally deterministic and has strict markers so it can be reused as a “universal context wrapper”:
 
-Common knobs:
+- First line is exactly: `Given this context:`
+- Last line is exactly: `I have the following question:`
 
-- `--max-files 1000` — analyze more files
-- `--max-depth 5` — show a deeper repository tree
-- `--max-summary-chars 1200` — cap per-file summaries
-- `--max-functions 30` / `--max-classes 20` — cap extracted signatures per file
+### Using the generated context with an LLM
 
-## How it works (high level)
+1. Open `CODEBASE_CONTEXT.md`.
+2. Paste its contents into your LLM chat.
+3. After the final line (`I have the following question:`), type your actual question.
 
-- Recursively scans the repository with a deterministic walk order
-- Ignores common junk directories and binary/generated/minified files
-- Detects languages/frameworks via file extensions, dependency files, and import heuristics
-- Extracts a compact “API/architecture surface” (entrypoints, routes, models, exports)
-- Ranks important files and emits structured Markdown optimized for LLM ingestion
-
-## Example output (excerpt)
+### Output preview
 
 ```md
 Given this context:
@@ -108,14 +60,36 @@ Given this context:
 1. Project Overview
 - Purpose (inferred): ...
 - Application type (inferred): ...
-...
+
+5. Important Files
+- `src/...` ...
 
 15. Optimized Agent Context
 - App type: ...
-...
 
 I have the following question:
 ```
+
+## How it works (high level)
+
+- Deterministically walks the repository (stable ordering)
+- Skips common junk, binaries, generated/minified assets, and very large files
+- Detects languages/frameworks via extensions + dependency/config heuristics
+- Extracts a compact “architecture surface” (entrypoints, routes, models, exports, signatures)
+- Ranks “important” files with simple architecture signals (entrypoints, routing, configs, central imports)
+
+## CLI
+
+```bash
+python codebase2context.py --help
+```
+
+Common knobs:
+
+- `--max-files` — cap how many files are analyzed (default is conservative)
+- `--max-depth` — cap repository tree depth in the output
+- `--max-summary-chars` — cap per-file summary size
+- `--max-functions` / `--max-classes` — cap extracted signatures per file
 
 ## Included example codebase
 
@@ -130,20 +104,45 @@ cd exmaple_codebase
 python codebase2context.py
 ```
 
-## What it detects (heuristics)
+## Detection (heuristics)
 
 - Languages: Python, JavaScript, TypeScript, Go, Rust, Java, C#, PHP
-- Frameworks: inferred from dependencies and imports (e.g. FastAPI, Flask, Django, Express, React, Next.js, etc.)
-- Entry points: `main.py`, `app.py`, `server.js`, `index.ts`, Docker entrypoints, etc.
-- Important files: ranked by architecture signals (entrypoints, routes, models, central imports, config)
-- Token optimization: summarizes and extracts signatures instead of dumping full files
+- Frameworks: inferred from dependencies/imports (e.g. FastAPI, Flask, Django, Express, React, Next.js, etc.)
+- Entrypoints: `main.py`, `app.py`, `server.js`, `index.ts`, Docker entrypoints, etc.
+- Token optimization: prefers summaries + signatures over full-file dumps
 
-## Ignored junk by default
+## Ignore rules
 
-The tool automatically ignores common noise:
+The tool intentionally ignores common noise such as:
 
-- `.git`, `node_modules`, `dist`, `build`, `coverage`, `.next`, `.nuxt`, `.cache`, `venv`, `.venv`, `__pycache__`, `target`, `.idea`, `.vscode`, etc.
-- Binary files and large generated assets
-- Minified bundles (e.g. `*.min.js`)
-- Lockfiles where appropriate
-- `.env` / `.env.*` (to avoid leaking secrets). Prefer `.env.example`.
+- `.git`, `node_modules`, `dist`, `build`, `coverage`, `.next`, `.nuxt`, `.cache`, `venv`, `.venv`, `__pycache__`, `target`, `.idea`, `.vscode`
+- Lockfiles (e.g. `package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`, etc.)
+- Minified bundles (e.g. `*.min.js`, `*.min.css`, `*.bundle.js`)
+- Many binary / archive formats (`.png`, `.pdf`, `.zip`, `.exe`, etc.)
+- Secrets by default: `.env` and `.env.*` (except `.env.example`)
+
+It also skips very large files (currently > ~2MB) to keep output compact and avoid wasting tokens.
+
+## Privacy & safety
+
+- The script makes no network requests and does not call any APIs.
+- Treat the generated context file as sensitive: it may include filenames, summaries, and extracted signatures from your codebase.
+
+## Contributing
+
+Issues and PRs are welcome. If you report a bug, include:
+
+- OS + Python version
+- A minimal repo layout that reproduces the behavior (or anonymized file names)
+- The command you ran (including flags)
+
+When updating the example workflow or output, regenerate `exmaple_codebase/CODEBASE_CONTEXT.md` by running:
+
+```bash
+cd exmaple_codebase
+python codebase2context.py
+```
+
+## Author
+
+Created by Eduardo J. Barrios (GitHub: `@edujbarrios`).
