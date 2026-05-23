@@ -91,6 +91,19 @@ Common knobs:
 - `--max-summary-chars` — cap per-file summary size
 - `--max-functions` / `--max-classes` — cap extracted signatures per file
 
+## Included example codebase
+
+This repository includes an example “toy repo” at `exmaple_codebase/` plus a pre-generated sample output:
+
+- `exmaple_codebase/CODEBASE_CONTEXT.md`
+
+To regenerate it (demonstrating the “copy the file into a repo and run it” workflow):
+
+```bash
+cd exmaple_codebase
+python codebase2context.py
+```
+
 ## Detection (heuristics)
 
 - Languages: Python, JavaScript, TypeScript, Go, Rust, Java, C#, PHP
@@ -122,6 +135,13 @@ Issues and PRs are welcome. If you report a bug, include:
 - OS + Python version
 - A minimal repo layout that reproduces the behavior (or anonymized file names)
 - The command you ran (including flags)
+
+When updating the example workflow or output, regenerate `exmaple_codebase/CODEBASE_CONTEXT.md` by running:
+
+```bash
+cd exmaple_codebase
+python codebase2context.py
+```
 
 ## Author
 
