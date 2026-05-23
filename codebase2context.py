@@ -18,12 +18,13 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import math
 import os
+import posixpath
 import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import DefaultDict, Iterable, Iterator, Optional
 
@@ -71,6 +72,8 @@ IGNORED_FILE_NAMES = {
     "Pipfile.lock",
     "Cargo.lock",
     "go.sum",
+    # secrets (prefer .env.example instead)
+    ".env",
 }
 
 IGNORED_FILE_SUFFIXES = {
@@ -106,6 +109,10 @@ IGNORED_FILE_SUFFIXES = {
     ".mp3",
     ".wav",
     ".flac",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
 }
 
 
@@ -200,6 +207,7 @@ class FileFacts:
     routes: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
     todo_markers: int = 0
+    imported_by: int = 0
     summary: str = ""
     responsibilities: list[str] = field(default_factory=list)
     score: float = 0.0
@@ -231,6 +239,8 @@ def _should_ignore_dir(dirname: str) -> bool:
 def _should_ignore_file(path: Path) -> bool:
     name = path.name
     if name in IGNORED_FILE_NAMES:
+        return True
+    if name.startswith(".env.") and name != ".env.example":
         return True
     suf = path.suffix.lower()
     if suf in IGNORED_FILE_SUFFIXES:
@@ -320,7 +330,6 @@ def _is_config_name(name: str) -> bool:
         "cargo.toml",
         "makefile",
         ".env.example",
-        ".env",
         ".github/workflows",
         "dockerfile",
         "docker-compose.yml",
@@ -525,10 +534,88 @@ def score_file(f: FileFacts) -> float:
     if f.is_test:
         score -= 2.0
     score += min(2.0, f.todo_markers * 0.2)
+    # Import centrality bonus is added later (after repo-wide graph pass).
     # Prefer moderate sized files (huge files tend to be noisy)
     if f.size_bytes > 250_000:
         score -= 2.0
     return score
+
+
+def apply_import_centrality(root: Path, files: list[FileFacts]) -> None:
+    """
+    Best-effort import graph centrality for Python + JS/TS.
+    Updates FileFacts.imported_by and increases FileFacts.score deterministically.
+    """
+
+    by_path: dict[str, FileFacts] = {f.path: f for f in files}
+
+    # Python module mapping: module.name -> relpath
+    py_module_to_path: dict[str, str] = {}
+    for f in files:
+        if f.language != "Python" or not f.path.endswith(".py"):
+            continue
+        mod = f.path[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        py_module_to_path[mod] = f.path
+
+    # JS/TS relpaths for fast lookups
+    js_paths: set[str] = {f.path for f in files if f.language in {"JavaScript", "TypeScript"}}
+
+    imported_by: DefaultDict[str, int] = defaultdict(int)
+
+    def add_edge(target: str) -> None:
+        if target in by_path:
+            imported_by[target] += 1
+
+    # Python: match longest dotted import to known module names
+    py_modules_sorted = sorted(py_module_to_path.keys(), key=lambda s: (-len(s), s))
+    for f in files:
+        if f.language != "Python":
+            continue
+        for imp in f.imports:
+            # Normalize: keep dotted module prefix only (drop imported symbol if present).
+            cand = imp.strip().strip(".")
+            if not cand:
+                continue
+            # Quick exact match
+            if cand in py_module_to_path:
+                add_edge(py_module_to_path[cand])
+                continue
+            # Longest prefix match (e.g., "pkg.mod.symbol" -> "pkg.mod")
+            for mod in py_modules_sorted:
+                if cand == mod or cand.startswith(mod + "."):
+                    add_edge(py_module_to_path[mod])
+                    break
+
+    # JS/TS: resolve relative imports (./, ../) to repo relpaths
+    suffixes = [".ts", ".tsx", ".js", ".jsx"]
+    for f in files:
+        if f.language not in {"JavaScript", "TypeScript"}:
+            continue
+        base_dir = posixpath.dirname(f.path) or "."
+        for imp in f.imports:
+            if not imp.startswith("."):
+                continue
+            rel = posixpath.normpath(posixpath.join(base_dir, imp))
+            if rel.startswith("../") or rel == "..":
+                continue
+            # Try direct, with extension, and index.* fallbacks
+            candidates: list[str] = []
+            if any(rel.endswith(s) for s in suffixes):
+                candidates.append(rel)
+            else:
+                candidates.extend([rel + s for s in suffixes])
+                candidates.extend([rel.rstrip("/") + "/index" + s for s in suffixes])
+            for c in candidates:
+                if c in js_paths:
+                    add_edge(c)
+                    break
+
+    # Apply results deterministically
+    for path, count in sorted(imported_by.items(), key=lambda kv: kv[0]):
+        by_path[path].imported_by = count
+        by_path[path].score += min(4.0, math.log1p(count) * 1.25)
 
 
 def _safe_split_lines(text: str, max_lines: int = 4000) -> list[str]:
@@ -816,7 +903,10 @@ def _detect_configs_and_deps(root: Path) -> tuple[dict[str, str], dict[str, str]
         data = _load_json(pkg_json)
         scripts = data.get("scripts") or {}
         if isinstance(scripts, dict) and scripts:
-            sample = ", ".join(sorted(scripts.keys())[:10])
+            preferred = ["dev", "start", "build", "test", "lint", "typecheck", "format"]
+            keys = sorted(scripts.keys())
+            ordered = [k for k in preferred if k in scripts] + [k for k in keys if k not in preferred]
+            sample = ", ".join(ordered[:12])
             configs["package.json"] = f"Scripts: {sample}"
         all_deps: dict[str, str] = {}
         for k in ("dependencies", "devDependencies", "peerDependencies"):
@@ -850,8 +940,14 @@ def _detect_configs_and_deps(root: Path) -> tuple[dict[str, str], dict[str, str]
     pyproject = root / "pyproject.toml"
     if pyproject.exists():
         pkg_mgrs.add("pip")
-        configs["pyproject.toml"] = "Python project configuration"
         text = _read_text_safely(pyproject)
+        if "[tool.poetry]" in text:
+            configs["pyproject.toml"] = "Python project configuration (Poetry)"
+            pkg_mgrs.add("poetry")
+        elif re.search(r"(?m)^\\[project\\]\\s*$", text):
+            configs["pyproject.toml"] = "Python project configuration (PEP 621)"
+        else:
+            configs["pyproject.toml"] = "Python project configuration"
         deps_from_pyproject = _extract_pyproject_deps(text)
         for name in sorted(deps_from_pyproject):
             deps.setdefault(name, _dep_purpose(name))
@@ -889,14 +985,20 @@ def _detect_configs_and_deps(root: Path) -> tuple[dict[str, str], dict[str, str]
 
     makefile = root / "Makefile"
     if makefile.exists():
-        configs["Makefile"] = "Build/run automation"
+        targets = _extract_makefile_targets(_read_text_safely(makefile))
+        if targets:
+            configs["Makefile"] = f"Build/run automation (targets: {', '.join(targets[:10])})"
+        else:
+            configs["Makefile"] = "Build/run automation"
 
     # Basic CI detection
     gha = root / ".github" / "workflows"
     if gha.exists() and gha.is_dir():
         workflows = sorted([p.name for p in gha.glob("*.yml")]) + sorted([p.name for p in gha.glob("*.yaml")])
         if workflows:
-            configs[".github/workflows/"] = f"GitHub Actions workflows: {', '.join(workflows[:8])}"
+            cmds = _extract_github_actions_run_commands(gha, workflows)
+            extra = f"; run cmds: {', '.join(cmds[:6])}" if cmds else ""
+            configs[".github/workflows/"] = f"GitHub Actions workflows: {', '.join(workflows[:8])}{extra}"
 
     return configs, deps, sorted(frameworks), sorted(pkg_mgrs)
 
@@ -932,6 +1034,45 @@ def _extract_cargo_deps(text: str) -> list[str]:
         for name in re.findall(r"^\\s*([A-Za-z0-9_-]+)\\s*=", section, flags=re.M):
             deps.add(name)
     return sorted(deps)
+
+
+def _extract_makefile_targets(text: str) -> list[str]:
+    targets: set[str] = set()
+    for line in text.splitlines():
+        if not line or line.startswith("\t") or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        head = line.split(":", 1)[0].strip()
+        if not head or " " in head or "$" in head or "%" in head:
+            continue
+        if head in {".PHONY", ".DEFAULT_GOAL"}:
+            continue
+        targets.add(head)
+    return sorted(targets)
+
+
+def _extract_github_actions_run_commands(workflows_dir: Path, workflow_names: list[str]) -> list[str]:
+    cmds: list[str] = []
+    seen: set[str] = set()
+    for name in workflow_names[:15]:
+        p = workflows_dir / name
+        if not p.exists():
+            continue
+        text = _read_text_safely(p, 120_000)
+        for m in re.finditer(r"(?m)^\\s*run:\\s*(.+)\\s*$", text):
+            cmd = m.group(1).strip()
+            if cmd and cmd not in seen:
+                seen.add(cmd)
+                cmds.append(cmd)
+        for m in re.finditer(r"(?m)^\\s*-\\s*run:\\s*(.+)\\s*$", text):
+            cmd = m.group(1).strip()
+            if cmd and cmd not in seen:
+                seen.add(cmd)
+                cmds.append(cmd)
+        if len(cmds) >= 12:
+            break
+    return cmds
 
 
 def _frameworks_from_dep_names(dep_names: set[str]) -> set[str]:
@@ -977,6 +1118,56 @@ def _frameworks_from_dep_names(dep_names: set[str]) -> set[str]:
         frameworks.add("Gin (Go)")
     if {"actix-web"} & lowered:
         frameworks.add("actix-web (Rust)")
+    return frameworks
+
+
+def _frameworks_from_code(files: list[FileFacts]) -> set[str]:
+    frameworks: set[str] = set()
+    for f in files:
+        imps = {i.lower() for i in f.imports}
+        if f.language == "Python":
+            if any(i == "fastapi" or i.startswith("fastapi.") for i in imps):
+                frameworks.add("FastAPI/Starlette")
+            if any(i == "starlette" or i.startswith("starlette.") for i in imps):
+                frameworks.add("FastAPI/Starlette")
+            if any(i == "flask" or i.startswith("flask.") for i in imps):
+                frameworks.add("Flask")
+            if any(i == "django" or i.startswith("django.") for i in imps):
+                frameworks.add("Django")
+            if any(i == "pytest" or i.startswith("pytest.") for i in imps):
+                frameworks.add("Pytest")
+            if any(i == "click" or i.startswith("click.") for i in imps):
+                frameworks.add("Click (CLI)")
+            if any(i == "typer" or i.startswith("typer.") for i in imps):
+                frameworks.add("Typer (CLI)")
+            if any(i == "argparse" or i.startswith("argparse.") for i in imps):
+                frameworks.add("argparse (CLI)")
+        elif f.language in {"JavaScript", "TypeScript"}:
+            if any(i == "express" or i.endswith("/express") for i in imps):
+                frameworks.add("Express")
+            if any(i == "react" or i.endswith("/react") for i in imps):
+                frameworks.add("React")
+            if any(i == "next" or i.endswith("/next") for i in imps):
+                frameworks.add("Next.js")
+            if any(i == "@nestjs/common" or i.startswith("@nestjs/") for i in imps):
+                frameworks.add("NestJS")
+            if any(i == "jest" or i.startswith("@jest/") for i in imps):
+                frameworks.add("Jest")
+            if any(i == "vitest" for i in imps):
+                frameworks.add("Vitest")
+        elif f.language == "Go":
+            if any(i == "github.com/gin-gonic/gin" for i in imps):
+                frameworks.add("Gin (Go)")
+        elif f.language == "Rust":
+            # Rust imports aren't extracted here; rely on Cargo.toml for precision.
+            continue
+        elif f.language == "Java":
+            # Spring annotations appear in routes; use that as a signal.
+            if any(r.startswith(("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "ROUTE ")) for r in f.routes):
+                frameworks.add("Spring (heuristic)")
+        elif f.language == "C#":
+            if f.routes:
+                frameworks.add("ASP.NET (heuristic)")
     return frameworks
 
 
@@ -1082,12 +1273,34 @@ def _infer_architecture(files: list[FileFacts]) -> list[str]:
     return notes[:8] or ["Architecture inferred from file layout and entrypoints"]
 
 
-def _build_run_instructions(configs: dict[str, str], frameworks: list[str], deps: dict[str, str]) -> list[str]:
+def _build_run_instructions(root: Path, configs: dict[str, str], frameworks: list[str], deps: dict[str, str]) -> list[str]:
     instructions: list[str] = []
-    if "package.json" in configs:
-        instructions.extend(["npm install", "npm run dev (or npm start)", "npm test"])
-    if "pyproject.toml" in configs or "requirements.txt" in configs:
-        instructions.extend(["python -m venv .venv && source .venv/bin/activate", "pip install -r requirements.txt", "pytest"])
+    if "package.json" in configs and (root / "package.json").exists():
+        instructions.append("npm install")
+        data = _load_json(root / "package.json")
+        scripts = data.get("scripts") if isinstance(data, dict) else {}
+        if isinstance(scripts, dict):
+            for k in ("dev", "start", "build", "test", "lint", "typecheck"):
+                if k in scripts:
+                    instructions.append(f"npm run {k}")
+        if not any(s.startswith("npm run") for s in instructions):
+            instructions.extend(["npm run dev (or npm start)", "npm test"])
+
+    if "requirements.txt" in configs:
+        instructions.extend(
+            [
+                "python -m venv .venv && source .venv/bin/activate",
+                "pip install -r requirements.txt",
+                "pytest",
+            ]
+        )
+    elif "pyproject.toml" in configs and (root / "pyproject.toml").exists():
+        text = _read_text_safely(root / "pyproject.toml")
+        if "[tool.poetry]" in text:
+            instructions.extend(["poetry install", "poetry run pytest", "poetry run python -m <module>"])
+        else:
+            instructions.extend(["python -m venv .venv && source .venv/bin/activate", "pip install -e .", "pytest"])
+
     if "Dockerfile" in configs:
         instructions.append("docker build -t app .")
     if any("Docker Compose" in f for f in frameworks) or any(k.startswith("docker-compose") for k in configs):
@@ -1096,6 +1309,11 @@ def _build_run_instructions(configs: dict[str, str], frameworks: list[str], deps
         instructions.extend(["go test ./...", "go run ."])
     if "Cargo.toml" in configs:
         instructions.extend(["cargo test", "cargo run"])
+    if "Makefile" in configs and (root / "Makefile").exists():
+        targets = _extract_makefile_targets(_read_text_safely(root / "Makefile"))
+        for k in ("test", "lint", "build", "run", "dev"):
+            if k in targets:
+                instructions.append(f"make {k}")
     # Deduplicate
     out: list[str] = []
     seen: set[str] = set()
@@ -1184,14 +1402,17 @@ def build_repo_facts(root: Path, limits: Limits) -> RepoFacts:
     # Remove "minified skipped" pseudo-items from downstream views
     analyzed = [f for f in analyzed if f.score >= -0.5]
 
+    apply_import_centrality(root, analyzed)
+
     langs = Counter(f.language for f in analyzed)
     configs, deps, frameworks, pkg_mgrs = _detect_configs_and_deps(root)
+    frameworks = sorted(set(frameworks) | _frameworks_from_code(analyzed))
 
     entrypoints = sorted([f for f in analyzed if f.is_entrypoint], key=lambda x: x.path)
     api_surface = _derive_api_surface(analyzed)
     data_models = _derive_data_models(analyzed)
     test_facts = _testing_facts(root, analyzed, frameworks, deps)
-    build_run = _build_run_instructions(configs, frameworks, deps)
+    build_run = _build_run_instructions(root, configs, frameworks, deps)
     dev_notes = _dev_notes(analyzed)
     arch_notes = _infer_architecture(analyzed)
 
@@ -1221,7 +1442,6 @@ def _top_important_files(files: list[FileFacts], limit: int = 25) -> list[FileFa
 
 
 def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
-    now = datetime.utcnow().strftime("%Y-%m-%d")
     purpose = _infer_project_purpose(repo.root, repo.files, repo.frameworks)
     app_type = infer_application_type(repo.languages, repo.frameworks, repo.entrypoints)
     total_analyzed = len(repo.files)
@@ -1298,6 +1518,8 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
     for f in important:
         md.append(f"- `{f.path}`")
         md.append(f"  - Summary: {f.summary}")
+        if f.imported_by >= 3 and not f.is_test:
+            md.append(f"  - Imported by: {f.imported_by} files (heuristic)")
         if f.responsibilities:
             md.append(f"  - Responsibilities: {', '.join(f.responsibilities)}")
         if f.exports:
@@ -1499,4 +1721,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
