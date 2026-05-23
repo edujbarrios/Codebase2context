@@ -516,6 +516,35 @@ def _infer_responsibilities(f: FileFacts) -> list[str]:
     return out[:6]
 
 
+def importance_reasons(f: FileFacts) -> list[str]:
+    reasons: list[str] = []
+    if f.is_entrypoint:
+        reasons.append("Entrypoint")
+    if f.is_config:
+        reasons.append("Configuration")
+    if f.routes:
+        reasons.append("API surface")
+    if f.models:
+        reasons.append("Data models")
+    if f.imported_by >= 3 and not f.is_test:
+        reasons.append("High import centrality")
+    # Lightweight path-based hints
+    p = f.path.lower()
+    if any(k in p for k in ("/service", "/usecase", "/core", "/domain")):
+        reasons.append("Core business logic")
+    if any(k in p for k in ("/db", "/repo", "/repository", "/storage", "/migrat")):
+        reasons.append("Persistence layer")
+    if f.is_test:
+        reasons.append("Testing")
+    # Deduplicate
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out[:6]
+
 def score_file(f: FileFacts) -> float:
     score = 0.0
     p = f.path.lower()
@@ -1520,6 +1549,9 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
         md.append(f"  - Summary: {f.summary}")
         if f.imported_by >= 3 and not f.is_test:
             md.append(f"  - Imported by: {f.imported_by} files (heuristic)")
+        imp = importance_reasons(f)
+        if imp:
+            md.append(f"  - Architectural importance: {', '.join(imp)}")
         if f.responsibilities:
             md.append(f"  - Responsibilities: {', '.join(f.responsibilities)}")
         if f.exports:
@@ -1714,6 +1746,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     repo = build_repo_facts(root, limits)
     md = generate_markdown(repo, limits)
+    lines = md.splitlines()
+    if not lines or lines[0] != "Given this context:" or lines[-1] != "I have the following question:":
+        print("error: generated Markdown did not match required start/end markers", file=sys.stderr)
+        return 2
     out = write_output(root, args.output, md)
     print(f"Wrote {out}")
     return 0
