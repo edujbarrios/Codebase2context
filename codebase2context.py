@@ -38,6 +38,13 @@ MAX_FILES_ANALYZED = 500
 MAX_FUNCTIONS_PER_FILE = 30
 MAX_CLASSES_PER_FILE = 20
 
+# Markdown output limits (token-optimizations).
+MAX_FRAMEWORKS_LISTED = 12
+MAX_IMPORTANT_FILES_LISTED = 20
+MAX_DEPENDENCIES_LISTED = 30
+MAX_API_SURFACE_LISTED = 60
+MAX_DATA_MODELS_LISTED = 60
+
 
 # -----------------------------
 # Ignore rules
@@ -417,6 +424,13 @@ def _truncate(s: str, max_chars: int) -> str:
     if len(s) <= max_chars:
         return s
     return s[: max_chars - 1].rstrip() + "…"
+
+
+def _join_limited(items: Iterable[str], limit: int, *, sep: str = ", ") -> str:
+    xs = [x for x in items if x]
+    if len(xs) <= limit:
+        return sep.join(xs)
+    return sep.join(xs[:limit]) + "…"
 
 
 def _count_todo_markers(text: str) -> int:
@@ -1433,8 +1447,8 @@ def _internal_relationships(files: list[FileFacts]) -> list[str]:
 def build_repo_facts(root: Path, limits: Limits) -> RepoFacts:
     paths, skipped = scan_repository(root, limits)
     analyzed: list[FileFacts] = [analyze_file(root, p, limits) for p in paths]
-    # Remove "minified skipped" pseudo-items from downstream views
-    analyzed = [f for f in analyzed if f.score >= -0.5]
+    # Remove "minified skipped" pseudo-items from downstream views (without dropping tests).
+    analyzed = [f for f in analyzed if f.summary != "(minified asset skipped)"]
 
     apply_import_centrality(root, analyzed)
 
@@ -1475,12 +1489,37 @@ def _top_important_files(files: list[FileFacts], limit: int = 25) -> list[FileFa
     return ranked[:limit]
 
 
+def _format_important_file_lines(f: FileFacts) -> list[str]:
+    reasons = ", ".join(importance_reasons(f))
+    base = f"- `{f.path}` — {reasons}; {f.summary}"
+    lines = [_truncate(base, 340)]
+
+    details: list[str] = []
+    if f.imported_by >= 3 and not f.is_test:
+        details.append(f"imported_by={f.imported_by}")
+    if f.routes:
+        # Keep only method + path to reduce repetition (handler name is already in exports/functions).
+        routes = [r.split("->", 1)[0].strip() for r in f.routes]
+        details.append("routes: " + _join_limited(routes, 6))
+    if f.models:
+        details.append("models: " + _join_limited(f.models, 8))
+    elif f.exports:
+        details.append("exports: " + _join_limited(f.exports, 8))
+
+    if details:
+        lines.append(_truncate("  - " + "; ".join(details), 360))
+    return lines
+
+
 def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
     purpose = _infer_project_purpose(repo.root, repo.files, repo.frameworks)
     app_type = infer_application_type(repo.languages, repo.frameworks, repo.entrypoints)
     total_analyzed = len(repo.files)
     language_list = ", ".join([f"{k} ({v})" for k, v in repo.languages.most_common()])
-    frameworks_list = ", ".join(repo.frameworks) if repo.frameworks else "None detected (heuristic)"
+    if repo.frameworks:
+        frameworks_list = _join_limited(repo.frameworks, MAX_FRAMEWORKS_LISTED)
+    else:
+        frameworks_list = "None detected (heuristic)"
     pkg_mgrs = ", ".join(repo.package_managers) if repo.package_managers else "None detected"
 
     files_paths = [repo.root / f.path for f in repo.files if not f.path.startswith("/")]
@@ -1493,13 +1532,13 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
     if not entry_lines:
         entry_lines.append("- (No obvious entrypoints detected; heuristics look for main/app/server/index files)")
 
-    important = _top_important_files(repo.files, limit=30)
+    important = _top_important_files(repo.files, limit=MAX_IMPORTANT_FILES_LISTED)
 
     md: list[str] = []
     md.append("Given this context:")
     md.append("")
 
-    md.append("1. Project Overview")
+    md.append("## 1. Project Overview")
     md.append(f"- Purpose (inferred): {purpose}")
     md.append(f"- Application type (inferred): {app_type}")
     md.append(f"- Architecture (inferred): {', '.join(repo.architecture_notes)}")
@@ -1508,7 +1547,7 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
     md.append(f"- Repository scale: {total_analyzed} files analyzed, {repo.skipped_files} skipped (filters/limits)")
     md.append("")
 
-    md.append("2. Tech Stack")
+    md.append("## 2. Tech Stack")
     md.append(f"- Languages: {', '.join([k for k, _ in repo.languages.most_common()]) or 'Unknown'}")
     md.append(f"- Frameworks: {frameworks_list}")
     md.append(f"- Package managers: {pkg_mgrs}")
@@ -1538,40 +1577,23 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
         md.append(f"- Datastores/queues: {', '.join(sorted(set(dbq)))}")
     md.append("")
 
-    md.append("3. Repository Structure")
+    md.append("## 3. Repository Structure")
     md.append("- Tree (filtered, max depth limited):")
-    for line in tree:
-        md.append(f"  {line}")
+    md.append("```text")
+    md.extend(tree)
+    md.append("```")
     md.append("")
 
-    md.append("4. Entry Points")
+    md.append("## 4. Entry Points")
     md.extend(entry_lines)
     md.append("")
 
-    md.append("5. Important Files")
+    md.append("## 5. Important Files")
     for f in important:
-        md.append(f"- `{f.path}`")
-        md.append(f"  - Summary: {f.summary}")
-        if f.imported_by >= 3 and not f.is_test:
-            md.append(f"  - Imported by: {f.imported_by} files (heuristic)")
-        imp = importance_reasons(f)
-        if imp:
-            md.append(f"  - Architectural importance: {', '.join(imp)}")
-        if f.responsibilities:
-            md.append(f"  - Responsibilities: {', '.join(f.responsibilities)}")
-        if f.exports:
-            md.append(f"  - Exports: {', '.join(f.exports[:12])}{'…' if len(f.exports) > 12 else ''}")
-        if f.classes:
-            md.append(f"  - Classes: {', '.join(f.classes[:8])}{'…' if len(f.classes) > 8 else ''}")
-        if f.functions:
-            md.append(f"  - Functions: {', '.join(f.functions[:8])}{'…' if len(f.functions) > 8 else ''}")
-        if f.routes:
-            md.append(f"  - Routes: {', '.join(f.routes[:6])}{'…' if len(f.routes) > 6 else ''}")
-        if f.models:
-            md.append(f"  - Models: {', '.join(f.models[:8])}{'…' if len(f.models) > 8 else ''}")
+        md.extend(_format_important_file_lines(f))
     md.append("")
 
-    md.append("6. Configuration")
+    md.append("## 6. Configuration")
     if repo.configs:
         for k in sorted(repo.configs.keys(), key=str.lower):
             md.append(f"- `{k}` — {repo.configs[k]}")
@@ -1579,43 +1601,52 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
         md.append("- No common configuration files detected (heuristic)")
     md.append("")
 
-    md.append("7. Dependency Summary")
+    md.append("## 7. Dependency Summary")
     if repo.dependencies:
         # Prioritize known purposes and common deps.
         important_deps = sorted(repo.dependencies.items(), key=lambda kv: (kv[1] == "Dependency", kv[0].lower()))
-        for name, purpose_ in important_deps[:40]:
+        shown = important_deps[:MAX_DEPENDENCIES_LISTED]
+        for name, purpose_ in shown:
             md.append(f"- {name} → {purpose_}")
+        if len(important_deps) > len(shown):
+            md.append(f"- …and {len(important_deps) - len(shown)} more")
     else:
         md.append("- No dependencies detected from config files (heuristic)")
     md.append("")
 
-    md.append("8. API Surface")
+    md.append("## 8. API Surface")
     if repo.api_surface:
-        for r in repo.api_surface[:80]:
+        shown = repo.api_surface[:MAX_API_SURFACE_LISTED]
+        for r in shown:
             md.append(f"- {r}")
+        if len(repo.api_surface) > len(shown):
+            md.append(f"- …and {len(repo.api_surface) - len(shown)} more")
     else:
         md.append("- No obvious API surface detected (heuristic)")
     md.append("")
 
-    md.append("9. Data Models")
+    md.append("## 9. Data Models")
     if repo.data_models:
-        for m in repo.data_models[:80]:
+        shown = repo.data_models[:MAX_DATA_MODELS_LISTED]
+        for m in shown:
             md.append(f"- {m}")
+        if len(repo.data_models) > len(shown):
+            md.append(f"- …and {len(repo.data_models) - len(shown)} more")
     else:
         md.append("- No obvious data models detected (heuristic)")
     md.append("")
 
-    md.append("10. Internal Relationships")
+    md.append("## 10. Internal Relationships")
     for n in _internal_relationships(repo.files):
         md.append(f"- {n}")
     md.append("")
 
-    md.append("11. Testing")
+    md.append("## 11. Testing")
     for t in repo.test_facts:
         md.append(f"- {t}")
     md.append("")
 
-    md.append("12. Build / Run Instructions")
+    md.append("## 12. Build / Run Instructions")
     if repo.build_run_instructions:
         for c in repo.build_run_instructions:
             md.append(f"- `{c}`")
@@ -1623,17 +1654,17 @@ def generate_markdown(repo: RepoFacts, limits: Limits) -> str:
         md.append("- No build/run commands inferred (heuristic)")
     md.append("")
 
-    md.append("13. Development Notes")
+    md.append("## 13. Development Notes")
     for n in repo.dev_notes[:12]:
         md.append(f"- {n}")
     md.append("")
 
-    md.append("14. Suggested Questions")
+    md.append("## 14. Suggested Questions")
     for q in suggested_questions(repo):
         md.append(f"- {q}")
     md.append("")
 
-    md.append("15. Optimized Agent Context")
+    md.append("## 15. Optimized Agent Context")
     for line in optimized_agent_context(repo, limits):
         md.append(f"- {line}")
     md.append("")
